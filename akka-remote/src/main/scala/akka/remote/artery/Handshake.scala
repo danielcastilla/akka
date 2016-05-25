@@ -4,8 +4,8 @@
 package akka.remote.artery
 
 import scala.concurrent.duration._
-import scala.util.Success
 import scala.util.control.NoStackTrace
+
 import akka.remote.EndpointManager.Send
 import akka.remote.UniqueAddress
 import akka.stream.Attributes
@@ -17,7 +17,6 @@ import akka.stream.stage.GraphStageLogic
 import akka.stream.stage.InHandler
 import akka.stream.stage.OutHandler
 import akka.stream.stage.TimerGraphStageLogic
-import java.util.concurrent.TimeUnit
 
 /**
  * INTERNAL API
@@ -62,6 +61,7 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
       private var handshakeState: HandshakeState = Start
       private var lastMessageTime = System.nanoTime()
       private val injectHandshakeIntervalNanos = injectHandshakeInterval.toNanos
+      private var pendingMessage: Send = null
 
       override def preStart(): Unit = {
         val uniqueRemoteAddress = outboundContext.associationState.uniqueRemoteAddress
@@ -93,29 +93,38 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
         // FIXME if nanoTime for each message is too costly we could let the TaskRunner update
         //       a volatile field with current time less frequently (low resolution time is ok for this)
         val now = System.nanoTime()
-        if (System.nanoTime() - lastMessageTime >= injectHandshakeIntervalNanos)
-          outboundContext.sendControl(HandshakeReq(outboundContext.localAddress))
+        if (System.nanoTime() - lastMessageTime >= injectHandshakeIntervalNanos) {
+          pushHandshakeReq()
+          pendingMessage = grab(in)
+        } else {
+          push(out, grab(in))
+        }
         lastMessageTime = now
-
-        push(out, grab(in))
       }
 
       // OutHandler
       override def onPull(): Unit = {
         handshakeState match {
-          case Completed ⇒ pull(in)
+          case Completed ⇒
+            if (pendingMessage eq null)
+              pull(in)
+            else {
+              push(out, pendingMessage)
+              pendingMessage = null
+            }
           case Start ⇒
             // will pull when handshake reply is received (uniqueRemoteAddress completed)
             handshakeState = ReqInProgress
             scheduleOnce(HandshakeTimeout, timeout)
             schedulePeriodically(HandshakeRetryTick, retryInterval)
-            sendHandshakeReq()
+            pushHandshakeReq()
           case ReqInProgress ⇒ // will pull when handshake reply is received
         }
       }
 
-      private def sendHandshakeReq(): Unit =
-        outboundContext.sendControl(HandshakeReq(outboundContext.localAddress))
+      private def pushHandshakeReq(): Unit = {
+        push(out, Send(HandshakeReq(outboundContext.localAddress), None, outboundContext.dummyRecipient, None))
+      }
 
       private def handshakeCompleted(): Unit = {
         handshakeState = Completed
@@ -126,9 +135,9 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
       override protected def onTimer(timerKey: Any): Unit =
         timerKey match {
           case HandshakeRetryTick ⇒
-            sendHandshakeReq()
+            if (isAvailable(out))
+              pushHandshakeReq()
           case HandshakeTimeout ⇒
-            // FIXME would it make sense to retry a few times before failing?
             failStage(new HandshakeTimeoutException(
               s"Handshake with [${outboundContext.remoteAddress}] did not complete within ${timeout.toMillis} ms"))
         }
@@ -156,9 +165,7 @@ private[akka] class InboundHandshake(inboundContext: InboundContext, inControlSt
           override def onPush(): Unit = {
             grab(in) match {
               case InboundEnvelope(_, _, HandshakeReq(from), _, _) ⇒
-                inboundContext.completeHandshake(from)
-                inboundContext.sendControl(from.address, HandshakeRsp(inboundContext.localAddress))
-                pull(in)
+                onHandshakeReq(from)
               case InboundEnvelope(_, _, HandshakeRsp(from), _, _) ⇒
                 inboundContext.completeHandshake(from)
                 pull(in)
@@ -168,8 +175,20 @@ private[akka] class InboundHandshake(inboundContext: InboundContext, inControlSt
         })
       else
         setHandler(in, new InHandler {
-          override def onPush(): Unit = onMessage(grab(in))
+          override def onPush(): Unit = {
+            grab(in) match {
+              case InboundEnvelope(_, _, HandshakeReq(from), _, _) ⇒
+                onHandshakeReq(from)
+              case other ⇒ onMessage(other)
+            }
+          }
         })
+
+      private def onHandshakeReq(from: UniqueAddress): Unit = {
+        inboundContext.completeHandshake(from)
+        inboundContext.sendControl(from.address, HandshakeRsp(inboundContext.localAddress))
+        pull(in)
+      }
 
       private def onMessage(env: InboundEnvelope): Unit = {
         if (isKnownOrigin(env.originUid))
