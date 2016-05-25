@@ -79,7 +79,7 @@ private[akka] final case class InboundEnvelope(
   recipientAddress: Address,
   message: AnyRef,
   senderOption: Option[ActorRef],
-  originAddress: UniqueAddress)
+  originUid: Long)
 
 /**
  * INTERNAL API
@@ -102,6 +102,16 @@ private[akka] trait InboundContext {
    * Lookup the outbound association for a given address.
    */
   def association(remoteAddress: Address): OutboundContext
+
+  /**
+   * Lookup the outbound association for a given UID.
+   * Will return `null` if the UID is unknown, i.e.
+   * handshake not completed. `null` is used instead of `Optional`
+   * to avoid allocations.
+   */
+  def association(uid: Long): OutboundContext
+
+  def completeHandshake(peer: UniqueAddress): Unit
 
 }
 
@@ -150,7 +160,7 @@ private[akka] final class AssociationState(
   }
 
   def isQuarantined(uid: Long): Boolean = {
-    // FIXME does this mean boxing (allocation) because of Set[Long]? Use specialized Set. LongMap?
+    // FIXME does this mean boxing (allocation) because of Set[Long]? Use specialized Set. org.agrona.collections.LongHashSet?
     quarantined(uid)
   }
 
@@ -182,8 +192,6 @@ private[akka] trait OutboundContext {
   def remoteAddress: Address
 
   def associationState: AssociationState
-
-  def completeHandshake(peer: UniqueAddress): Unit
 
   def quarantine(reason: String): Unit
 
@@ -236,6 +244,7 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   private val handshakeTimeout: FiniteDuration =
     system.settings.config.getMillisDuration("akka.remote.handshake-timeout").requiring(_ > Duration.Zero,
       "handshake-timeout must be > 0")
+  private val injectHandshakeInterval: FiniteDuration = 1.second
   private val giveUpSendAfter: FiniteDuration = 60.seconds
 
   private val largeMessageDestinations =
@@ -253,7 +262,8 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   private val taskRunner = new TaskRunner(system)
 
   // FIXME: This does locking on putIfAbsent, we need something smarter
-  private[this] val associations = new ConcurrentHashMap[Address, Association]()
+  private[this] val associationsByAddress = new ConcurrentHashMap[Address, Association]()
+  private[this] val associationsByUid = new ConcurrentHashMap[Long, Association]()
 
   private val restartTimeout: FiniteDuration = 5.seconds // FIXME config
   private val maxRestarts = 5 // FIXME config
@@ -280,7 +290,7 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
     // TODO: Have a supervisor actor
     _localAddress = UniqueAddress(
       Address("artery", system.name, remoteSettings.ArteryHostname, port),
-      AddressUidExtension(system).addressUid)
+      AddressUidExtension(system).longAddressUid)
     materializer = ActorMaterializer()(system)
 
     messageDispatcher = new MessageDispatcher(system, provider)
@@ -458,10 +468,10 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   }
 
   override def association(remoteAddress: Address): Association = {
-    val current = associations.get(remoteAddress)
+    val current = associationsByAddress.get(remoteAddress)
     if (current ne null) current
     else {
-      associations.computeIfAbsent(remoteAddress, new JFunction[Address, Association] {
+      associationsByAddress.computeIfAbsent(remoteAddress, new JFunction[Address, Association] {
         override def apply(remoteAddress: Address): Association = {
           val newAssociation = new Association(ArteryTransport.this, materializer, remoteAddress, controlSubject, largeMessageDestinations)
           newAssociation.associate() // This is a bit costly for this blocking method :(
@@ -471,15 +481,28 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
     }
   }
 
+  override def association(uid: Long): Association =
+    associationsByUid.get(uid)
+
+  override def completeHandshake(peer: UniqueAddress): Unit = {
+    val a = association(peer.address)
+    a.completeHandshake(peer)
+    val previous = associationsByUid.put(peer.uid, a)
+    if ((previous ne null) && (previous ne a))
+      throw new IllegalArgumentException(s"completeHandshake UID collision old [$previous] new [$a]")
+  }
+
   private def publishLifecycleEvent(event: RemotingLifecycleEvent): Unit =
     eventPublisher.notifyListeners(event)
 
-  override def quarantine(remoteAddress: Address, uid: Option[Int]): Unit =
-    association(remoteAddress).quarantine(reason = "", uid) // FIXME change the method signature (old remoting) to include reason?
+  override def quarantine(remoteAddress: Address, uid: Option[Int]): Unit = {
+    // FIXME change the method signature (old remoting) to include reason and use Long uid?
+    association(remoteAddress).quarantine(reason = "", uid.map(_.toLong))
+  }
 
   def outbound(outboundContext: OutboundContext): Sink[Send, Future[Done]] = {
     Flow.fromGraph(killSwitch.flow[Send])
-      .via(new OutboundHandshake(outboundContext, handshakeTimeout, handshakeRetryInterval))
+      .via(new OutboundHandshake(outboundContext, handshakeTimeout, handshakeRetryInterval, injectHandshakeInterval))
       .via(encoder)
       .toMat(new AeronSink(outboundChannel(outboundContext.remoteAddress), ordinaryStreamId, aeron, taskRunner,
         envelopePool, giveUpSendAfter))(Keep.right)
@@ -487,7 +510,7 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
 
   def outboundLarge(outboundContext: OutboundContext): Sink[Send, Future[Done]] = {
     Flow.fromGraph(killSwitch.flow[Send])
-      .via(new OutboundHandshake(outboundContext, handshakeTimeout, handshakeRetryInterval))
+      .via(new OutboundHandshake(outboundContext, handshakeTimeout, handshakeRetryInterval, injectHandshakeInterval))
       .via(createEncoder(largeEnvelopePool))
       .toMat(new AeronSink(outboundChannel(outboundContext.remoteAddress), largeStreamId, aeron, taskRunner,
         envelopePool, giveUpSendAfter))(Keep.right)
@@ -495,7 +518,7 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
 
   def outboundControl(outboundContext: OutboundContext): Sink[Send, (OutboundControlIngress, Future[Done])] = {
     Flow.fromGraph(killSwitch.flow[Send])
-      .via(new OutboundHandshake(outboundContext, handshakeTimeout, handshakeRetryInterval))
+      .via(new OutboundHandshake(outboundContext, handshakeTimeout, handshakeRetryInterval, injectHandshakeInterval))
       .via(new SystemMessageDelivery(outboundContext, systemMessageResendInterval, remoteSettings.SysMsgBufferSize))
       .viaMat(new OutboundControlJunction(outboundContext))(Keep.right)
       .via(encoder)

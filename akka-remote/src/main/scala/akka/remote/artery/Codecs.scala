@@ -141,7 +141,7 @@ class Decoder(
           localAddress, // FIXME: Is this needed anymore? What should we do here?
           MessageSerializer.deserializeForArtery(system, serialization, headerBuilder, envelope),
           senderOption, // FIXME: No need for an option, decode simply to deadLetters instead
-          UniqueAddress(senderOption.get.path.address, headerBuilder.uid)) // FIXME see issue #20568
+          headerBuilder.uid)
 
         pool.release(envelope)
         push(out, decoded)

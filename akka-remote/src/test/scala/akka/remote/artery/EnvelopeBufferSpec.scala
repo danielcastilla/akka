@@ -115,7 +115,7 @@ class EnvelopeBufferSpec extends AkkaSpec {
       headerOut.classManifest should ===("manifest1")
 
       headerIn.version = 3
-      headerIn.uid = Int.MinValue
+      headerIn.uid = Long.MinValue
       headerIn.senderActorRef = "uncompressable0"
       headerIn.recipientActorRef = "reallylongcompressablestring"
       headerIn.serializer = "serializer0"
@@ -131,7 +131,7 @@ class EnvelopeBufferSpec extends AkkaSpec {
       envelope.parseHeader(headerOut)
 
       headerOut.version should ===(3)
-      headerOut.uid should ===(Int.MinValue)
+      headerOut.uid should ===(Long.MinValue)
       headerOut.senderActorRef should ===("uncompressable0")
       headerOut.recipientActorRef should ===("reallylongcompressablestring")
       headerOut.serializer should ===("serializer0")

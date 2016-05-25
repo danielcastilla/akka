@@ -50,12 +50,12 @@ private[remote] object EnvelopeBuffer {
 
   val VersionOffset = 0
   val UidOffset = 4
-  val SenderActorRefTagOffset = 8
-  val RecipientActorRefTagOffset = 12
-  val SerializerTagOffset = 16
-  val ClassManifestTagOffset = 24
+  val SenderActorRefTagOffset = 12
+  val RecipientActorRefTagOffset = 16
+  val SerializerTagOffset = 20
+  val ClassManifestTagOffset = 28
 
-  val LiteralsSectionOffset = 32
+  val LiteralsSectionOffset = 36
 
   val UsAscii = Charset.forName("US-ASCII")
 
@@ -89,8 +89,8 @@ sealed trait HeaderBuilder {
   def version_=(v: Int): Unit
   def version: Int
 
-  def uid_=(u: Int): Unit
-  def uid: Int
+  def uid_=(u: Long): Unit
+  def uid: Long
 
   def senderActorRef_=(ref: String): Unit
   def senderActorRef: String
@@ -112,7 +112,7 @@ sealed trait HeaderBuilder {
  */
 private[remote] final class HeaderBuilderImpl(val compressionTable: LiteralCompressionTable) extends HeaderBuilder {
   var version: Int = _
-  var uid: Int = _
+  var uid: Long = _
 
   // Fields only available for EnvelopeBuffer
   var _senderActorRef: String = null
@@ -213,7 +213,7 @@ private[remote] final class EnvelopeBuffer(val byteBuffer: ByteBuffer) {
 
     // Write fixed length parts
     byteBuffer.putInt(header.version)
-    byteBuffer.putInt(header.uid)
+    byteBuffer.putLong(header.uid)
 
     // Write compressable, variable-length parts always to the actual position of the buffer
     // Write tag values explicitly in their proper offset
@@ -249,7 +249,7 @@ private[remote] final class EnvelopeBuffer(val byteBuffer: ByteBuffer) {
 
     // Read fixed length parts
     header.version = byteBuffer.getInt
-    header.uid = byteBuffer.getInt
+    header.uid = byteBuffer.getLong
 
     // Read compressable, variable-length parts always from the actual position of the buffer
     // Read tag values explicitly from their proper offset

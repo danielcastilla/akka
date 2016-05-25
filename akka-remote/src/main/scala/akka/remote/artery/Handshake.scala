@@ -6,7 +6,6 @@ package akka.remote.artery
 import scala.concurrent.duration._
 import scala.util.Success
 import scala.util.control.NoStackTrace
-
 import akka.remote.EndpointManager.Send
 import akka.remote.UniqueAddress
 import akka.stream.Attributes
@@ -18,6 +17,7 @@ import akka.stream.stage.GraphStageLogic
 import akka.stream.stage.InHandler
 import akka.stream.stage.OutHandler
 import akka.stream.stage.TimerGraphStageLogic
+import java.util.concurrent.TimeUnit
 
 /**
  * INTERNAL API
@@ -47,7 +47,8 @@ private[akka] object OutboundHandshake {
 /**
  * INTERNAL API
  */
-private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout: FiniteDuration, retryInterval: FiniteDuration)
+private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout: FiniteDuration,
+                                      retryInterval: FiniteDuration, injectHandshakeInterval: FiniteDuration)
   extends GraphStage[FlowShape[Send, Send]] {
 
   val in: Inlet[Send] = Inlet("OutboundHandshake.in")
@@ -59,6 +60,8 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
       import OutboundHandshake._
 
       private var handshakeState: HandshakeState = Start
+      private var lastMessageTime = System.nanoTime()
+      private val injectHandshakeIntervalNanos = injectHandshakeInterval.toNanos
 
       override def preStart(): Unit = {
         val uniqueRemoteAddress = outboundContext.associationState.uniqueRemoteAddress
@@ -84,6 +87,16 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
       override def onPush(): Unit = {
         if (handshakeState != Completed)
           throw new IllegalStateException(s"onPush before handshake completed, was [$handshakeState]")
+
+        // inject a HandshakeReq once in a while to trigger a new handshake when destination
+        // system has been restarted
+        // FIXME if nanoTime for each message is too costly we could let the TaskRunner update
+        //       a volatile field with current time less frequently (low resolution time is ok for this)
+        val now = System.nanoTime()
+        if (System.nanoTime() - lastMessageTime >= injectHandshakeIntervalNanos)
+          outboundContext.sendControl(HandshakeReq(outboundContext.localAddress))
+        lastMessageTime = now
+
         push(out, grab(in))
       }
 
@@ -134,7 +147,7 @@ private[akka] class InboundHandshake(inboundContext: InboundContext, inControlSt
   override val shape: FlowShape[InboundEnvelope, InboundEnvelope] = FlowShape(in, out)
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new TimerGraphStageLogic(shape) with OutHandler {
+    new TimerGraphStageLogic(shape) with OutHandler with StageLogging {
       import OutboundHandshake._
 
       // InHandler
@@ -143,11 +156,11 @@ private[akka] class InboundHandshake(inboundContext: InboundContext, inControlSt
           override def onPush(): Unit = {
             grab(in) match {
               case InboundEnvelope(_, _, HandshakeReq(from), _, _) ⇒
-                inboundContext.association(from.address).completeHandshake(from)
+                inboundContext.completeHandshake(from)
                 inboundContext.sendControl(from.address, HandshakeRsp(inboundContext.localAddress))
                 pull(in)
               case InboundEnvelope(_, _, HandshakeRsp(from), _, _) ⇒
-                inboundContext.association(from.address).completeHandshake(from)
+                inboundContext.completeHandshake(from)
                 pull(in)
               case other ⇒ onMessage(other)
             }
@@ -159,25 +172,26 @@ private[akka] class InboundHandshake(inboundContext: InboundContext, inControlSt
         })
 
       private def onMessage(env: InboundEnvelope): Unit = {
-        if (isKnownOrigin(env.originAddress))
+        if (isKnownOrigin(env.originUid))
           push(out, env)
         else {
-          inboundContext.sendControl(env.originAddress.address, HandshakeReq(inboundContext.localAddress))
-          // FIXME Note that we have the originAddress that would be needed to complete the handshake
-          //       but it is not done here because the handshake might exchange more information.
-          //       Is that a valid thought?
-          // drop message from unknown, this system was probably restarted
+          // FIXME remove, only debug
+          log.warning(s"Dropping message [{}] from unknown system with UID [{}]. " +
+            "This system with UID [{}] was probably restarted. " +
+            "Messages will be accepted when new handshake has been completed.",
+            env.message.getClass.getName, inboundContext.localAddress.uid, env.originUid)
+          if (log.isDebugEnabled)
+            log.debug(s"Dropping message [{}] from unknown system with UID [{}]. " +
+              "This system with UID [{}] was probably restarted. " +
+              "Messages will be accepted when new handshake has been completed.",
+              env.message.getClass.getName, inboundContext.localAddress.uid, env.originUid)
           pull(in)
         }
       }
 
-      private def isKnownOrigin(originAddress: UniqueAddress): Boolean = {
+      private def isKnownOrigin(originUid: Long): Boolean = {
         // FIXME these association lookups are probably too costly for each message, need local cache or something
-        val associationState = inboundContext.association(originAddress.address).associationState
-        associationState.uniqueRemoteAddressValue() match {
-          case Some(Success(a)) if a.uid == originAddress.uid ⇒ true
-          case x ⇒ false
-        }
+        (inboundContext.association(originUid) ne null)
       }
 
       // OutHandler

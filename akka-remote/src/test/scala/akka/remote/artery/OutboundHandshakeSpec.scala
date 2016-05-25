@@ -31,12 +31,15 @@ class OutboundHandshakeSpec extends AkkaSpec with ImplicitSender {
   val addressA = UniqueAddress(Address("artery", "sysA", "hostA", 1001), 1)
   val addressB = UniqueAddress(Address("artery", "sysB", "hostB", 1002), 2)
 
-  private def setupStream(outboundContext: OutboundContext, timeout: FiniteDuration = 5.seconds,
-                          retryInterval: FiniteDuration = 10.seconds): (TestPublisher.Probe[String], TestSubscriber.Probe[Any]) = {
+  private def setupStream(
+    outboundContext: OutboundContext, timeout: FiniteDuration = 5.seconds,
+    retryInterval: FiniteDuration = 10.seconds,
+    injectHandshakeInterval: FiniteDuration = 10.seconds): (TestPublisher.Probe[String], TestSubscriber.Probe[Any]) = {
+
     val destination = null.asInstanceOf[RemoteActorRef] // not used
     TestSource.probe[String]
       .map(msg ⇒ Send(msg, None, destination, None))
-      .via(new OutboundHandshake(outboundContext, timeout, retryInterval))
+      .via(new OutboundHandshake(outboundContext, timeout, retryInterval, injectHandshakeInterval))
       .map { case Send(msg, _, _, _) ⇒ msg }
       .toMat(TestSink.probe[Any])(Keep.both)
       .run()
@@ -87,10 +90,35 @@ class OutboundHandshakeSpec extends AkkaSpec with ImplicitSender {
       upstream.sendNext("msg1")
       downstream.expectNoMsg(200.millis)
       // InboundHandshake stage will complete the handshake when receiving HandshakeRsp
-      inboundContext.association(addressB.address).completeHandshake(addressB)
+      inboundContext.completeHandshake(addressB)
       downstream.expectNext("msg1")
       upstream.sendNext("msg2")
       downstream.expectNext("msg2")
+      downstream.cancel()
+    }
+
+    "inject HandshakeReq" in {
+      val controlProbe = TestProbe()
+      val inboundContext = new TestInboundContext(localAddress = addressA, controlProbe = Some(controlProbe.ref))
+      val outboundContext = inboundContext.association(addressB.address)
+      val (upstream, downstream) = setupStream(outboundContext, injectHandshakeInterval = 500.millis)
+
+      downstream.request(10)
+      upstream.sendNext("msg1")
+      controlProbe.expectMsg(HandshakeReq(addressA))
+      inboundContext.completeHandshake(addressB)
+      downstream.expectNext("msg1")
+
+      controlProbe.expectNoMsg(600.millis)
+      upstream.sendNext("msg2")
+      upstream.sendNext("msg3")
+      upstream.sendNext("msg4")
+      controlProbe.expectMsg(HandshakeReq(addressA))
+      downstream.expectNext("msg2")
+      downstream.expectNext("msg3")
+      downstream.expectNext("msg4")
+      controlProbe.expectNoMsg(600.millis)
+
       downstream.cancel()
     }
 

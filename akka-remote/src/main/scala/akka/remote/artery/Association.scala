@@ -99,7 +99,7 @@ private[akka] class Association(
   def associationState: AssociationState =
     Unsafe.instance.getObjectVolatile(this, AbstractAssociation.sharedStateOffset).asInstanceOf[AssociationState]
 
-  override def completeHandshake(peer: UniqueAddress): Unit = {
+  def completeHandshake(peer: UniqueAddress): Unit = {
     require(remoteAddress == peer.address,
       s"wrong remote address in completeHandshake, got ${peer.address}, expected ${remoteAddress}")
     val current = associationState
@@ -177,7 +177,7 @@ private[akka] class Association(
     quarantine(reason, uid)
   }
 
-  @tailrec final def quarantine(reason: String, uid: Option[Int]): Unit = {
+  @tailrec final def quarantine(reason: String, uid: Option[Long]): Unit = {
     uid match {
       case Some(u) ⇒
         val current = associationState
@@ -279,4 +279,8 @@ private[akka] class Association(
         }
     }
   }
+
+  override def toString(): String =
+    s"Association($localAddress -> $remoteAddress with $associationState)"
+
 }
