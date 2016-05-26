@@ -56,6 +56,19 @@ class OutboundHandshakeSpec extends AkkaSpec with ImplicitSender {
       downstream.cancel()
     }
 
+    "send HandshakeReq also when uniqueRemoteAddress future completed at startup" in {
+      val inboundContext = new TestInboundContext(localAddress = addressA)
+      val outboundContext = inboundContext.association(addressB.address)
+      inboundContext.completeHandshake(addressB)
+      val (upstream, downstream) = setupStream(outboundContext)
+
+      upstream.sendNext("msg1")
+      downstream.request(10)
+      downstream.expectNext(HandshakeReq(addressA))
+      downstream.expectNext("msg1")
+      downstream.cancel()
+    }
+
     "timeout if handshake not completed" in {
       val inboundContext = new TestInboundContext(localAddress = addressA)
       val outboundContext = inboundContext.association(addressB.address)

@@ -528,9 +528,6 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
     // FIXME we can also add scrubbing stage that would collapse sys msg acks/nacks and remove duplicate Quarantine messages
   }
 
-  // FIXME hack until real envelopes, encoding originAddress in sender :)
-  private val dummySender = system.systemActorOf(Props.empty, "dummy")
-
   def createEncoder(pool: EnvelopeBufferPool): Flow[Send, EnvelopeBuffer, NotUsed] =
     Flow.fromGraph(new Encoder(localAddress, system, compression, pool))
 
