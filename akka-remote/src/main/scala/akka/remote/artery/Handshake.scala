@@ -40,6 +40,7 @@ private[akka] object OutboundHandshake {
 
   private case object HandshakeTimeout
   private case object HandshakeRetryTick
+  private case object InjectHandshakeTick
 
 }
 
@@ -59,9 +60,8 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
       import OutboundHandshake._
 
       private var handshakeState: HandshakeState = Start
-      private var lastMessageTime = System.nanoTime()
-      private val injectHandshakeIntervalNanos = injectHandshakeInterval.toNanos
       private var pendingMessage: Send = null
+      private var injectHandshakeTickScheduled = false
 
       // InHandler
       override def onPush(): Unit = {
@@ -70,16 +70,12 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
 
         // inject a HandshakeReq once in a while to trigger a new handshake when destination
         // system has been restarted
-        // FIXME if nanoTime for each message is too costly we could let the TaskRunner update
-        //       a volatile field with current time less frequently (low resolution time is ok for this)
-        val now = System.nanoTime()
-        if (System.nanoTime() - lastMessageTime >= injectHandshakeIntervalNanos) {
+        if (injectHandshakeTickScheduled) {
+          push(out, grab(in))
+        } else {
           pushHandshakeReq()
           pendingMessage = grab(in)
-        } else {
-          push(out, grab(in))
         }
-        lastMessageTime = now
       }
 
       // OutHandler
@@ -125,6 +121,8 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
       }
 
       private def pushHandshakeReq(): Unit = {
+        injectHandshakeTickScheduled = true
+        scheduleOnce(InjectHandshakeTick, injectHandshakeInterval)
         push(out, Send(HandshakeReq(outboundContext.localAddress), None, outboundContext.dummyRecipient, None))
       }
 
@@ -136,6 +134,9 @@ private[akka] class OutboundHandshake(outboundContext: OutboundContext, timeout:
 
       override protected def onTimer(timerKey: Any): Unit =
         timerKey match {
+          case InjectHandshakeTick ⇒
+            // next onPush message will trigger sending of HandshakeReq
+            injectHandshakeTickScheduled = false
           case HandshakeRetryTick ⇒
             if (isAvailable(out))
               pushHandshakeReq()
