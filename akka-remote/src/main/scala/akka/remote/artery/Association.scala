@@ -3,8 +3,10 @@
  */
 package akka.remote.artery
 
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.function.{ Function ⇒ JFunction }
 
 import scala.annotation.tailrec
 import scala.concurrent.Future
@@ -12,6 +14,7 @@ import scala.concurrent.Promise
 import scala.concurrent.duration._
 import scala.concurrent.duration.FiniteDuration
 import scala.util.Success
+
 import akka.{ Done, NotUsed }
 import akka.actor.ActorRef
 import akka.actor.ActorSelectionMessage
@@ -19,8 +22,8 @@ import akka.actor.Address
 import akka.actor.RootActorPath
 import akka.dispatch.sysmsg.SystemMessage
 import akka.event.Logging
-import akka.remote.EndpointManager.Send
 import akka.remote.{ LargeDestination, RegularDestination, RemoteActorRef, UniqueAddress }
+import akka.remote.EndpointManager.Send
 import akka.remote.artery.AeronSink.GaveUpSendingException
 import akka.remote.artery.InboundControlJunction.ControlMessageSubject
 import akka.remote.artery.OutboundControlJunction.OutboundControlIngress
@@ -283,4 +286,38 @@ private[akka] class Association(
   override def toString(): String =
     s"Association($localAddress -> $remoteAddress with $associationState)"
 
+}
+
+/**
+ * INTERNAL API
+ */
+private[remote] class AssociationRegistry(createAssociation: Address ⇒ Association) {
+  // FIXME: This does locking on putIfAbsent, we need something smarter
+  private[this] val associationsByAddress = new ConcurrentHashMap[Address, Association]()
+  private[this] val associationsByUid = new ConcurrentHashMap[Long, Association]()
+
+  def association(remoteAddress: Address): Association = {
+    val current = associationsByAddress.get(remoteAddress)
+    if (current ne null) current
+    else {
+      associationsByAddress.computeIfAbsent(remoteAddress, new JFunction[Address, Association] {
+        override def apply(remoteAddress: Address): Association = {
+          val newAssociation = createAssociation(remoteAddress)
+          newAssociation.associate() // This is a bit costly for this blocking method :(
+          newAssociation
+        }
+      })
+    }
+  }
+
+  def association(uid: Long): Association =
+    associationsByUid.get(uid)
+
+  def setUID(peer: UniqueAddress): Association = {
+    val a = association(peer.address)
+    val previous = associationsByUid.put(peer.uid, a)
+    if ((previous ne null) && (previous ne a))
+      throw new IllegalArgumentException(s"UID collision old [$previous] new [$a]")
+    a
+  }
 }

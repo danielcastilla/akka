@@ -5,8 +5,6 @@ package akka.remote.artery
 
 import java.io.File
 import java.nio.ByteOrder
-import java.util.concurrent.ConcurrentHashMap
-import java.util.function.{ Function ⇒ JFunction }
 
 import scala.concurrent.Future
 import scala.concurrent.Promise
@@ -261,10 +259,6 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   private val largeStreamId = 4
   private val taskRunner = new TaskRunner(system)
 
-  // FIXME: This does locking on putIfAbsent, we need something smarter
-  private[this] val associationsByAddress = new ConcurrentHashMap[Address, Association]()
-  private[this] val associationsByUid = new ConcurrentHashMap[Long, Association]()
-
   private val restartTimeout: FiniteDuration = 5.seconds // FIXME config
   private val maxRestarts = 5 // FIXME config
   private val restartCounter = new RestartCounter(maxRestarts, restartTimeout)
@@ -275,6 +269,9 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
   // FIXME: Compression table must be owned by each channel instead
   // of having a global one
   val compression = new Compression(system)
+
+  private val associationRegistry = new AssociationRegistry(
+    remoteAddress ⇒ new Association(this, materializer, remoteAddress, controlSubject, largeMessageDestinations))
 
   override def start(): Unit = {
     startMediaDriver()
@@ -467,29 +464,15 @@ private[remote] class ArteryTransport(_system: ExtendedActorSystem, _provider: R
     a.send(message, senderOption, recipient)
   }
 
-  override def association(remoteAddress: Address): Association = {
-    val current = associationsByAddress.get(remoteAddress)
-    if (current ne null) current
-    else {
-      associationsByAddress.computeIfAbsent(remoteAddress, new JFunction[Address, Association] {
-        override def apply(remoteAddress: Address): Association = {
-          val newAssociation = new Association(ArteryTransport.this, materializer, remoteAddress, controlSubject, largeMessageDestinations)
-          newAssociation.associate() // This is a bit costly for this blocking method :(
-          newAssociation
-        }
-      })
-    }
-  }
+  override def association(remoteAddress: Address): Association =
+    associationRegistry.association(remoteAddress)
 
   override def association(uid: Long): Association =
-    associationsByUid.get(uid)
+    associationRegistry.association(uid)
 
   override def completeHandshake(peer: UniqueAddress): Unit = {
-    val a = association(peer.address)
+    val a = associationRegistry.setUID(peer)
     a.completeHandshake(peer)
-    val previous = associationsByUid.put(peer.uid, a)
-    if ((previous ne null) && (previous ne a))
-      throw new IllegalArgumentException(s"completeHandshake UID collision old [$previous] new [$a]")
   }
 
   private def publishLifecycleEvent(event: RemotingLifecycleEvent): Unit =
